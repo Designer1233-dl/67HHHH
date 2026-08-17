@@ -2,11 +2,11 @@ import asyncio
 import html
 import logging
 import os
-import random
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
+from openai import OpenAI
 
 
 logging.basicConfig(level=logging.INFO)
@@ -14,130 +14,140 @@ logging.basicConfig(level=logging.INFO)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID_RAW = os.getenv("ADMIN_ID", "").strip()
-PHRASE_SEPARATOR = "||"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6").strip()
+OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "180").strip())
+OPENAI_SYSTEM_PROMPT = os.getenv(
+    "OPENAI_SYSTEM_PROMPT",
+    (
+        "Ты смешной Telegram-бот. "
+        "Отвечай всегда на русском языке. "
+        "Стиль: коротко, живо, мемно, с легким абсурдом и разговорной подачей. "
+        "Не пиши слишком длинно, обычно 1-3 предложения. "
+        "Если пользователь задает странный вопрос, отвечай уверенно и с юмором. "
+        "Если сообщения мало или оно непонятно, все равно дай забавный осмысленный ответ."
+    ),
+).strip()
 
-DEFAULT_INTRO_REPLIES = [
-    "Ya na meste. Pishi vopros, a ya vydam maksimalno strannyy verdikt.",
-    "Rezhim haotichnyh otvetov vklyuchen. Davai svoy vopros.",
-    "Privet. Ya bot s somnitelnoy ekspertizoy i bolshoy lyubovyu k absurdnim otvetam.",
+
+INTRO_REPLIES = [
+    "Привет. Я на связи и готов нести нейросетевой хаос.",
+    "Залетаю в чат с умным лицом и сомнительными шутками.",
+    "Пиши что угодно. Я отвечу по-русски и с вайбом странной уверенности.",
 ]
 
-DEFAULT_QUESTION_OPENERS = [
-    "Nu konechno",
-    "Sto procentov",
-    "AHAHAH, da",
-    "Ne, nu eto ochevidno",
-    "Sekundu... da",
-    "Moya ekspertnaia komissiya reshila: da",
+MANUAL_MODE_ACKS = [
+    "Сообщение улетело админу. Ждем его мудрейший ответ.",
+    "Принял. Вопрос уже у админа.",
+    "Передал твое сообщение человеку с правом ручного вердикта.",
 ]
-
-DEFAULT_QUESTION_CHAOS = [
-    "tyyyyy chego voobshe sprashivaesh",
-    "eto uzhe baza",
-    "tut bez variantov",
-    "ves chat eto podtverzhdaet",
-    "kosmos lichno odobril etot otvet",
-    "eto dazhe ne obsuzhdaetsya",
-]
-
-DEFAULT_STATEMENT_REPLIES = [
-    "Zvuchit moshchno. Ya odobryayu etot haos.",
-    "Eto soobshchenie ofitsialno proshlo proverku na smeshnyavost.",
-    "Ya by otvetil umno, no vybral absurd.",
-    "Silno. Gromko. Nemnogo podozritelno.",
-    "Moy professionalnyy vyvod: lol.",
-]
-
-DEFAULT_MANUAL_MODE_ACKS = [
-    "Tvoye soobshchenie uletelo adminu. Zhdem otvet.",
-    "Prinyato. Admin uzhe smotrit i dumaet chto skazat.",
-    "Ya peredal vopros glavnomu cheloveku po haosu.",
-]
-
-
-def load_phrase_list(env_name: str, fallback: list[str]) -> list[str]:
-    raw_value = os.getenv(env_name, "").strip()
-    if not raw_value:
-        return fallback
-
-    phrases = [item.strip() for item in raw_value.split(PHRASE_SEPARATOR)]
-    phrases = [item for item in phrases if item]
-    return phrases or fallback
-
-
-INTRO_REPLIES = load_phrase_list("INTRO_REPLIES", DEFAULT_INTRO_REPLIES)
-QUESTION_OPENERS = load_phrase_list("QUESTION_OPENERS", DEFAULT_QUESTION_OPENERS)
-QUESTION_CHAOS = load_phrase_list("QUESTION_CHAOS", DEFAULT_QUESTION_CHAOS)
-STATEMENT_REPLIES = load_phrase_list("STATEMENT_REPLIES", DEFAULT_STATEMENT_REPLIES)
-MANUAL_MODE_ACKS = load_phrase_list("MANUAL_MODE_ACKS", DEFAULT_MANUAL_MODE_ACKS)
 
 
 if ADMIN_ID_RAW:
     try:
         ADMIN_ID = int(ADMIN_ID_RAW)
     except ValueError as exc:
-        raise RuntimeError("ADMIN_ID dolzhen byt chislom.") from exc
+        raise RuntimeError("ADMIN_ID должен быть числом.") from exc
 else:
     ADMIN_ID = None
 
 
 manual_mode_enabled = os.getenv("MANUAL_MODE_DEFAULT", "0").strip().lower() in {"1", "true", "yes", "on"}
 forwarded_messages: dict[int, int] = {}
+openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 
 def is_admin(message: Message) -> bool:
     return ADMIN_ID is not None and message.from_user is not None and message.from_user.id == ADMIN_ID
 
 
-def build_funny_answer(text: str) -> str:
-    cleaned = " ".join(text.split())
-    if not cleaned:
-        return "Ty poteryal soobshchenie po doroge ili eto byl sekretnyy shifr?"
+def extract_user_text(message: Message) -> str:
+    if message.text:
+        return message.text
 
-    if "?" in cleaned:
-        base = cleaned.rstrip(" ?!.,")
-        return f"{random.choice(QUESTION_OPENERS)}, {base.lower()}? {random.choice(QUESTION_CHAOS)}."
+    if message.caption:
+        return message.caption
 
-    return random.choice(STATEMENT_REPLIES)
+    if message.sticker:
+        sticker_name = message.sticker.emoji or "без эмодзи"
+        return f"Пользователь прислал стикер: {sticker_name}."
+
+    if message.photo:
+        return "Пользователь прислал фото без подписи."
+
+    if message.voice:
+        return "Пользователь прислал голосовое сообщение."
+
+    if message.video:
+        return "Пользователь прислал видео."
+
+    if message.video_note:
+        return "Пользователь прислал видеокружок."
+
+    if message.animation:
+        return "Пользователь прислал гифку."
+
+    if message.document:
+        return f"Пользователь прислал файл: {message.document.file_name or 'без названия'}."
+
+    return "Пользователь прислал сообщение без текста. Ответь уместно и с юмором."
 
 
-def format_user_card(message: Message) -> str:
+def format_user_card(message: Message, user_text: str) -> str:
     user = message.from_user
     if user is None:
-        return "Polzovatel ne opredelen"
+        return "Пользователь не определен"
 
-    username = f"@{user.username}" if user.username else "bez username"
-    full_name = user.full_name or "bez imeni"
-    text = message.text or "[ne tekstovoe soobshchenie]"
-    safe_text = html.escape(text)
+    username = f"@{user.username}" if user.username else "без username"
+    full_name = user.full_name or "без имени"
+    safe_text = html.escape(user_text)
     return (
-        "Novoe soobshchenie v ruchnoy rezhim.\n"
+        "Новое сообщение в ручной режим.\n"
         f"User ID: <code>{user.id}</code>\n"
         f"Username: {html.escape(username)}\n"
-        f"Imya: {html.escape(full_name)}\n\n"
-        f"Vopros:\n{safe_text}\n\n"
-        "Otvet admina nuzhno otpravit reply na eto soobshchenie."
+        f"Имя: {html.escape(full_name)}\n\n"
+        f"Сообщение:\n{safe_text}\n\n"
+        "Ответ админа нужно отправить reply на это сообщение."
     )
 
 
+async def generate_ai_reply(user_text: str) -> str:
+    if openai_client is None:
+        raise RuntimeError("Не найден OPENAI_API_KEY. Добавь его в переменные окружения.")
+
+    def _request() -> str:
+        response = openai_client.responses.create(
+            model=OPENAI_MODEL,
+            input=[
+                {"role": "system", "content": OPENAI_SYSTEM_PROMPT},
+                {"role": "user", "content": user_text},
+            ],
+            max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
+        )
+        text = (response.output_text or "").strip()
+        return text or "Я задумался слишком глубоко. Напиши еще раз, и я вернусь с новым приколом."
+
+    return await asyncio.to_thread(_request)
+
+
 async def start_handler(message: Message) -> None:
-    await message.answer(random.choice(INTRO_REPLIES))
+    await message.answer(INTRO_REPLIES[message.message_id % len(INTRO_REPLIES)])
 
 
 async def admin_panel_handler(message: Message) -> None:
     if not is_admin(message):
-        await message.answer("Eta komanda tolko dlya admina.")
+        await message.answer("Эта команда только для админа.")
         return
 
-    status = "VKL" if manual_mode_enabled else "VYKL"
+    status = "ВКЛ" if manual_mode_enabled else "ВЫКЛ"
     await message.answer(
-        "Admin-panel:\n"
-        f"Ruchnoy rezhim: {status}\n\n"
-        "Komandy:\n"
-        "/manual_on - vklyuchit peresylku voprosov adminu\n"
-        "/manual_off - vyklyuchit peresylku i vernut randomnye otvety\n"
-        "/admin - pokazat etu panel\n\n"
-        "Kogda rezhim VKL, prosto otvechay reply na pereslannoe soobshchenie."
+        "Админ-панель:\n"
+        f"Ручной режим: {status}\n\n"
+        "Команды:\n"
+        "/manual_on - включить ручные ответы\n"
+        "/manual_off - выключить ручные ответы\n"
+        "/admin - показать эту панель\n\n"
+        "Когда режим ВКЛ, просто отвечай reply на пересланное сообщение."
     )
 
 
@@ -145,64 +155,79 @@ async def manual_on_handler(message: Message) -> None:
     global manual_mode_enabled
 
     if not is_admin(message):
-        await message.answer("Eta komanda tolko dlya admina.")
+        await message.answer("Эта команда только для админа.")
         return
 
     manual_mode_enabled = True
-    await message.answer("Ruchnoy rezhim VKL. Teper soobshcheniya polzovateley budut prihodit tebe.")
+    await message.answer("Ручной режим включен. Теперь сообщения пользователей будут приходить тебе.")
 
 
 async def manual_off_handler(message: Message) -> None:
     global manual_mode_enabled
 
     if not is_admin(message):
-        await message.answer("Eta komanda tolko dlya admina.")
+        await message.answer("Эта команда только для админа.")
         return
 
     manual_mode_enabled = False
-    await message.answer("Ruchnoy rezhim VYKL. Bot snova otvechaet sam svoim randomom.")
+    await message.answer("Ручной режим выключен. Бот снова отвечает нейросетью сам.")
 
 
-async def admin_reply_handler(message: Message) -> None:
+async def admin_reply_handler(message: Message) -> bool:
     if not is_admin(message):
-        return
+        return False
 
-    if not message.reply_to_message or not message.text:
-        return
+    if not message.reply_to_message:
+        return False
+
+    reply_text = message.text or message.caption
+    if not reply_text:
+        return False
 
     target_user_id = forwarded_messages.get(message.reply_to_message.message_id)
     if target_user_id is None:
-        return
+        return False
 
-    await message.bot.send_message(target_user_id, message.text)
-    await message.answer("Otpravil otvet polzovatelyu.")
+    await message.bot.send_message(target_user_id, reply_text)
+    await message.answer("Ответ отправлен пользователю.")
+    return True
 
 
-async def user_text_handler(message: Message) -> None:
-    if not message.text:
-        await message.answer("Ya poka druzhu tolko s tekstom. Kidai slovami.")
-        return
+async def message_handler(message: Message) -> None:
+    user_text = extract_user_text(message)
 
     if is_admin(message):
-        await admin_reply_handler(message)
+        handled = await admin_reply_handler(message)
+        if not handled and message.text and not message.text.startswith("/"):
+            await message.answer("Если хочешь ответить пользователю вручную, сделай reply на его пересланное сообщение.")
         return
 
     if manual_mode_enabled and ADMIN_ID is not None:
         admin_message = await message.bot.send_message(
             ADMIN_ID,
-            format_user_card(message),
+            format_user_card(message, user_text),
             parse_mode="HTML",
         )
-        forwarded_messages[admin_message.message_id] = message.from_user.id
-        await message.answer(random.choice(MANUAL_MODE_ACKS))
+        if message.from_user is not None:
+            forwarded_messages[admin_message.message_id] = message.from_user.id
+        await message.answer(MANUAL_MODE_ACKS[message.message_id % len(MANUAL_MODE_ACKS)])
         return
 
-    await message.answer(build_funny_answer(message.text))
+    try:
+        ai_reply = await generate_ai_reply(user_text)
+    except Exception:
+        logging.exception("Не удалось получить ответ от OpenAI")
+        await message.answer("Нейросеть что-то задумалась и зависла. Попробуй еще раз через пару секунд.")
+        return
+
+    await message.answer(ai_reply)
 
 
 async def main() -> None:
     if not BOT_TOKEN:
-        raise RuntimeError("Ne nayden BOT_TOKEN. Dobav ego v peremennye okruzheniya.")
+        raise RuntimeError("Не найден BOT_TOKEN. Добавь его в переменные окружения.")
+    if not OPENAI_API_KEY:
+        raise RuntimeError("Не найден OPENAI_API_KEY. Добавь его в переменные окружения.")
 
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
@@ -211,7 +236,7 @@ async def main() -> None:
     dp.message.register(admin_panel_handler, Command("admin"))
     dp.message.register(manual_on_handler, Command("manual_on"))
     dp.message.register(manual_off_handler, Command("manual_off"))
-    dp.message.register(user_text_handler, F.text)
+    dp.message.register(message_handler)
 
     await dp.start_polling(bot)
 
